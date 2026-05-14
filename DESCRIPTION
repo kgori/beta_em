@@ -1,0 +1,25 @@
+Package: betaem
+Type: Package
+Title: Expectation-Maximisation for Beta Mixture Models
+Version: 0.1.0
+Authors@R: c(person("Kevin", "Gori", email = "kcg25@cam.ac.uk", role = c("aut", "cre")))
+Maintainer: Kevin Gori <kcg25@cam.ac.uk>
+Description: Fits a mixture of Beta distributions to data in [0, 1] using the
+    Expectation-Maximisation algorithm. The core EM loop, E-step (weight
+    computation via log-sum-exp) and M-step (moment-matched parameter updates)
+    are implemented in C++ via Rcpp and RcppArmadillo for maximum performance.
+    An R-level wrapper preserves optional per-iteration plotting for
+    diagnostic use.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Depends: R (>= 3.5.0)
+Imports:
+    Rcpp (>= 1.0.0),
+    grid,
+    gridBase,
+    gridExtra
+LinkingTo:
+    Rcpp,
+    RcppArmadillo
+RoxygenNote: 7.2.0
