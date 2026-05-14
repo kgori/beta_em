@@ -96,3 +96,87 @@ estimate_mixture_cpp <- function(data, init_params, init_pi, max_steps = 1000L, 
     .Call(`_betaem_estimate_mixture_cpp`, data, init_params, init_pi, max_steps, tol)
 }
 
+#' Generate constrained initial parameter estimates
+#'
+#' Uses \code{\link{get_init_cpp}} with \code{k = 3} to obtain unconstrained
+#' starting values, then symmetrises them to satisfy the constraints
+#' \eqn{\text{params} = \{(a,b),\,(c,c),\,(b,a)\}},
+#' \eqn{\pi = \{x,\,y,\,x\}}.
+#'
+#' @param v Numeric vector of observations in \[0, 1\].
+#'
+#' @return A list with elements:
+#'   \describe{
+#'     \item{params}{\code{3 x 2} matrix satisfying the symmetry constraint.}
+#'     \item{pi}{Length-3 mixing proportions satisfying \eqn{\pi_1 = \pi_3}.}
+#'   }
+#' @export
+get_init_constrained_cpp <- function(v) {
+    .Call(`_betaem_get_init_constrained_cpp`, v)
+}
+
+#' Constrained EM M-step for the symmetric Beta mixture model
+#'
+#' Updates the four free parameters \eqn{(a, b, c, x)} of the constrained
+#' 3-component model
+#' \eqn{\pi_1 \text{Beta}(a,b) + \pi_2 \text{Beta}(c,c) + \pi_1 \text{Beta}(b,a)}
+#' (where \eqn{\pi_1 = \pi_3 = x} and \eqn{\pi_2 = y = 1 - 2x}) given the
+#' current posterior weights.
+#'
+#' @details
+#' \strong{Outer parameters \eqn{(a, b)}}:  fitted by moment-matching to an
+#' augmented dataset containing the original observations \eqn{x_i} weighted
+#' by \eqn{w_{i1}} (component 1) together with the reflected observations
+#' \eqn{1 - x_i} weighted by \eqn{w_{i3}} (component 3).  This correctly
+#' exploits the symmetry \eqn{\text{Beta}(x; b, a) = \text{Beta}(1-x; a, b)}.
+#'
+#' \strong{Middle parameter \eqn{c}}: the \eqn{\text{Beta}(c, c)} distribution
+#' is constrained to have mean 0.5, so \eqn{c} is estimated solely from the
+#' weighted variance of observations around 0.5, via
+#' \eqn{c = (1 - 4v) / (8v)} where
+#' \eqn{v = \sum_i w_{i2}(x_i - 0.5)^2 / \sum_i w_{i2}}.
+#'
+#' @param data    Numeric vector of observations in \[0, 1\].
+#' @param weights \code{ndata x 3} matrix of posterior weights from the
+#'   E-step, column order: component 1, 2, 3.
+#'
+#' @return A list with elements:
+#'   \describe{
+#'     \item{params}{\code{3 x 2} matrix of updated Beta parameters satisfying
+#'       the constraint: row 1 = \eqn{(a,b)}, row 2 = \eqn{(c,c)},
+#'       row 3 = \eqn{(b,a)}.}
+#'     \item{pi}{Updated length-3 mixing proportions with
+#'       \eqn{\pi_1 = \pi_3}.}
+#'   }
+#' @export
+get_updated_params_constrained_cpp <- function(data, weights) {
+    .Call(`_betaem_get_updated_params_constrained_cpp`, data, weights)
+}
+
+#' Fit the constrained symmetric Beta mixture model by EM
+#'
+#' Runs the EM algorithm for the 3-component model
+#' \eqn{x\,\text{Beta}(a,b) + y\,\text{Beta}(c,c) + x\,\text{Beta}(b,a)}
+#' where \eqn{2x + y = 1}.  The entire loop runs in C++.
+#'
+#' Initial parameters must satisfy the symmetry constraints; use
+#' \code{\link{get_init_constrained_cpp}} to obtain suitable starting values.
+#'
+#' @param data        Numeric vector of observations in \[0, 1\].
+#' @param init_params \code{3 x 2} matrix of initial Beta parameters
+#'   satisfying the constraint (row 1: \eqn{(a,b)}, row 2: \eqn{(c,c)},
+#'   row 3: \eqn{(b,a)}).
+#' @param init_pi     Length-3 mixing proportions with \eqn{\pi_1 = \pi_3}
+#'   (must sum to 1).
+#' @param max_steps   Maximum EM iterations (default 1000).
+#' @param tol         Convergence tolerance on the maximum relative parameter
+#'   change (default 1e-5).
+#'
+#' @return A list with the same structure as
+#'   \code{\link{estimate_mixture_cpp}}, with the additional element
+#'   \code{constrained = TRUE}.
+#' @export
+estimate_mixture_constrained_cpp <- function(data, init_params, init_pi, max_steps = 1000L, tol = 1e-5) {
+    .Call(`_betaem_estimate_mixture_constrained_cpp`, data, init_params, init_pi, max_steps, tol)
+}
+

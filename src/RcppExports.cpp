@@ -63,12 +63,53 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// get_init_constrained_cpp
+List get_init_constrained_cpp(const arma::vec& v);
+RcppExport SEXP _betaem_get_init_constrained_cpp(SEXP vSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const arma::vec& >::type v(vSEXP);
+    rcpp_result_gen = Rcpp::wrap(get_init_constrained_cpp(v));
+    return rcpp_result_gen;
+END_RCPP
+}
+// get_updated_params_constrained_cpp
+List get_updated_params_constrained_cpp(const arma::vec& data, const arma::mat& weights);
+RcppExport SEXP _betaem_get_updated_params_constrained_cpp(SEXP dataSEXP, SEXP weightsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const arma::vec& >::type data(dataSEXP);
+    Rcpp::traits::input_parameter< const arma::mat& >::type weights(weightsSEXP);
+    rcpp_result_gen = Rcpp::wrap(get_updated_params_constrained_cpp(data, weights));
+    return rcpp_result_gen;
+END_RCPP
+}
+// estimate_mixture_constrained_cpp
+List estimate_mixture_constrained_cpp(const arma::vec& data, const arma::mat& init_params, const arma::vec& init_pi, int max_steps, double tol);
+RcppExport SEXP _betaem_estimate_mixture_constrained_cpp(SEXP dataSEXP, SEXP init_paramsSEXP, SEXP init_piSEXP, SEXP max_stepsSEXP, SEXP tolSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const arma::vec& >::type data(dataSEXP);
+    Rcpp::traits::input_parameter< const arma::mat& >::type init_params(init_paramsSEXP);
+    Rcpp::traits::input_parameter< const arma::vec& >::type init_pi(init_piSEXP);
+    Rcpp::traits::input_parameter< int >::type max_steps(max_stepsSEXP);
+    Rcpp::traits::input_parameter< double >::type tol(tolSEXP);
+    rcpp_result_gen = Rcpp::wrap(estimate_mixture_constrained_cpp(data, init_params, init_pi, max_steps, tol));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_betaem_get_weights_cpp", (DL_FUNC) &_betaem_get_weights_cpp, 3},
     {"_betaem_get_updated_params_cpp", (DL_FUNC) &_betaem_get_updated_params_cpp, 2},
     {"_betaem_get_init_cpp", (DL_FUNC) &_betaem_get_init_cpp, 2},
     {"_betaem_estimate_mixture_cpp", (DL_FUNC) &_betaem_estimate_mixture_cpp, 5},
+    {"_betaem_get_init_constrained_cpp", (DL_FUNC) &_betaem_get_init_constrained_cpp, 1},
+    {"_betaem_get_updated_params_constrained_cpp", (DL_FUNC) &_betaem_get_updated_params_constrained_cpp, 2},
+    {"_betaem_estimate_mixture_constrained_cpp", (DL_FUNC) &_betaem_estimate_mixture_constrained_cpp, 5},
     {NULL, NULL, 0}
 };
 

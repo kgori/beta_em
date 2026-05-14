@@ -404,3 +404,318 @@ List estimate_mixture_cpp(const arma::vec& data,
         Named("bic")            = bic
     );
 }
+
+// ===========================================================================
+// Constrained 3-component model:
+//   params = { Beta(a,b),  Beta(c,c),  Beta(b,a) }
+//   pi     = { x,          y,          x         }   with 2x + y = 1
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Internal helper: clamp a scalar to [lo, hi]
+// ---------------------------------------------------------------------------
+static inline double clamp_val(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// ---------------------------------------------------------------------------
+// Exported: Constrained initialisation  —  get_init_constrained_cpp
+// ---------------------------------------------------------------------------
+
+//' Generate constrained initial parameter estimates
+//'
+//' Uses \code{\link{get_init_cpp}} with \code{k = 3} to obtain unconstrained
+//' starting values, then symmetrises them to satisfy the constraints
+//' \eqn{\text{params} = \{(a,b),\,(c,c),\,(b,a)\}},
+//' \eqn{\pi = \{x,\,y,\,x\}}.
+//'
+//' @param v Numeric vector of observations in \[0, 1\].
+//'
+//' @return A list with elements:
+//'   \describe{
+//'     \item{params}{\code{3 x 2} matrix satisfying the symmetry constraint.}
+//'     \item{pi}{Length-3 mixing proportions satisfying \eqn{\pi_1 = \pi_3}.}
+//'   }
+//' @export
+// [[Rcpp::export]]
+List get_init_constrained_cpp(const arma::vec& v) {
+    // Start from unconstrained 3-bin init
+    List init    = get_init_cpp(v, 3);
+    mat  params0 = as<mat>(init["params"]);
+    vec  pi0     = as<vec>(init["pi"]);
+
+    // Component 1 params: use left-bin (a, b) as-is
+    double a = params0(0, 0);
+    double b = params0(0, 1);
+
+    // Middle component: symmetrise by averaging its two shape params
+    double c = (params0(1, 0) + params0(1, 1)) / 2.0;
+    c = std::max(0.01, c);
+
+    // Outer mixing weight: average of left- and right-bin proportions
+    double x = (pi0(0) + pi0(2)) / 2.0;
+    double y = pi0(1);
+    double total = 2.0 * x + y;
+    if (total <= 0.0) { x = 1.0 / 3.0; y = 1.0 / 3.0; }
+    else              { x /= total;     y /= total;     }
+
+    // Enforce a <= b so component 1 is the left-tail component
+    if (a > b) std::swap(a, b);
+    a = std::max(0.01, a);
+    b = std::max(0.01, b);
+
+    mat new_params(3, 2);
+    new_params(0, 0) = a;   new_params(0, 1) = b;
+    new_params(1, 0) = c;   new_params(1, 1) = c;
+    new_params(2, 0) = b;   new_params(2, 1) = a;
+
+    vec new_pi = { x, y, x };
+
+    return List::create(
+        Named("params") = wrap(new_params),
+        Named("pi")     = wrap(new_pi)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Exported: Constrained M-step  —  get_updated_params_constrained_cpp
+// ---------------------------------------------------------------------------
+
+//' Constrained EM M-step for the symmetric Beta mixture model
+//'
+//' Updates the four free parameters \eqn{(a, b, c, x)} of the constrained
+//' 3-component model
+//' \eqn{\pi_1 \text{Beta}(a,b) + \pi_2 \text{Beta}(c,c) + \pi_1 \text{Beta}(b,a)}
+//' (where \eqn{\pi_1 = \pi_3 = x} and \eqn{\pi_2 = y = 1 - 2x}) given the
+//' current posterior weights.
+//'
+//' @details
+//' \strong{Outer parameters \eqn{(a, b)}}:  fitted by moment-matching to an
+//' augmented dataset containing the original observations \eqn{x_i} weighted
+//' by \eqn{w_{i1}} (component 1) together with the reflected observations
+//' \eqn{1 - x_i} weighted by \eqn{w_{i3}} (component 3).  This correctly
+//' exploits the symmetry \eqn{\text{Beta}(x; b, a) = \text{Beta}(1-x; a, b)}.
+//'
+//' \strong{Middle parameter \eqn{c}}: the \eqn{\text{Beta}(c, c)} distribution
+//' is constrained to have mean 0.5, so \eqn{c} is estimated solely from the
+//' weighted variance of observations around 0.5, via
+//' \eqn{c = (1 - 4v) / (8v)} where
+//' \eqn{v = \sum_i w_{i2}(x_i - 0.5)^2 / \sum_i w_{i2}}.
+//'
+//' @param data    Numeric vector of observations in \[0, 1\].
+//' @param weights \code{ndata x 3} matrix of posterior weights from the
+//'   E-step, column order: component 1, 2, 3.
+//'
+//' @return A list with elements:
+//'   \describe{
+//'     \item{params}{\code{3 x 2} matrix of updated Beta parameters satisfying
+//'       the constraint: row 1 = \eqn{(a,b)}, row 2 = \eqn{(c,c)},
+//'       row 3 = \eqn{(b,a)}.}
+//'     \item{pi}{Updated length-3 mixing proportions with
+//'       \eqn{\pi_1 = \pi_3}.}
+//'   }
+//' @export
+// [[Rcpp::export]]
+List get_updated_params_constrained_cpp(const arma::vec& data,
+                                         const arma::mat& weights) {
+    int n = data.n_elem;
+    if ((int)weights.n_rows != n)
+        stop("length(data) must equal nrow(weights)");
+    if ((int)weights.n_cols != 3)
+        stop("weights must have exactly 3 columns");
+
+    // --- Mixing proportions -------------------------------------------
+    // Each outer component gets half of the combined outer weight.
+    double sum_outer = accu(weights.col(0)) + accu(weights.col(2));
+    double x_new     = sum_outer / (2.0 * n);
+    double y_new     = accu(weights.col(1)) / n;
+    // Clamp to avoid degenerate pi
+    x_new = clamp_val(x_new, 1e-6, 0.5 - 1e-6);
+    y_new = clamp_val(y_new, 1e-6, 1.0 - 2e-6);
+    // Re-normalise so that 2x + y = 1 exactly
+    double pi_total = 2.0 * x_new + y_new;
+    x_new /= pi_total;
+    y_new /= pi_total;
+
+    // --- Outer component parameters (a, b) ----------------------------
+    // Build augmented dataset:
+    //   original data[i] with weight w1[i]  → models Beta(a, b)
+    //   reflected (1-data[i]) with weight w3[i] → models Beta(a, b) via symmetry
+    vec aug_data    = join_cols(data, 1.0 - data);
+    vec aug_weights = join_cols(weights.col(0), weights.col(2));
+    double total_ow = sum(aug_weights);
+
+    double m_outer, v_outer;
+    if (total_ow > 0.0) {
+        m_outer = dot(aug_data, aug_weights) / total_ow;
+        vec diff = aug_data - m_outer;
+        v_outer  = dot(diff % diff, aug_weights) / total_ow;
+    } else {
+        m_outer = 0.25;
+        v_outer = 0.01;
+    }
+    m_outer = clamp_val(m_outer, 1e-4, 1.0 - 1e-4);
+    double max_va = m_outer * (1.0 - m_outer) - 1e-6;
+    v_outer = clamp_val(v_outer, 1e-8, max_va);
+
+    vec ab = beta_ab_cpp(m_outer, v_outer);
+    double a = ab(0), b = ab(1);
+    // Ensure component 1 remains the left-tail (a <= b => mean <= 0.5)
+    if (a > b) std::swap(a, b);
+    a = std::max(0.01, a);
+    b = std::max(0.01, b);
+
+    // --- Middle component parameter (c) --------------------------------
+    // Beta(c, c) is constrained to mean = 0.5; estimate c from the
+    // variance of data around 0.5 using component-2 weights.
+    // Var[Beta(c,c)] = 1 / (4*(2c+1))  =>  c = (1 - 4v) / (8v)
+    double total_mw = accu(weights.col(1));
+    double c_val;
+    if (total_mw > 0.0) {
+        vec diff_mid = data - 0.5;
+        double v_mid = dot(diff_mid % diff_mid, weights.col(1)) / total_mw;
+        v_mid  = clamp_val(v_mid, 1e-8, 0.25 - 1e-6);
+        c_val  = (1.0 - 4.0 * v_mid) / (8.0 * v_mid);
+    } else {
+        c_val = 1.0;
+    }
+    c_val = std::max(0.01, c_val);
+
+    // --- Assemble result ----------------------------------------------
+    mat new_params(3, 2);
+    new_params(0, 0) = a;      new_params(0, 1) = b;
+    new_params(1, 0) = c_val;  new_params(1, 1) = c_val;
+    new_params(2, 0) = b;      new_params(2, 1) = a;
+
+    vec new_pi = { x_new, y_new, x_new };
+
+    return List::create(
+        Named("params") = wrap(new_params),
+        Named("pi")     = wrap(new_pi)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Exported: Constrained full EM  —  estimate_mixture_constrained_cpp
+// ---------------------------------------------------------------------------
+
+//' Fit the constrained symmetric Beta mixture model by EM
+//'
+//' Runs the EM algorithm for the 3-component model
+//' \eqn{x\,\text{Beta}(a,b) + y\,\text{Beta}(c,c) + x\,\text{Beta}(b,a)}
+//' where \eqn{2x + y = 1}.  The entire loop runs in C++.
+//'
+//' Initial parameters must satisfy the symmetry constraints; use
+//' \code{\link{get_init_constrained_cpp}} to obtain suitable starting values.
+//'
+//' @param data        Numeric vector of observations in \[0, 1\].
+//' @param init_params \code{3 x 2} matrix of initial Beta parameters
+//'   satisfying the constraint (row 1: \eqn{(a,b)}, row 2: \eqn{(c,c)},
+//'   row 3: \eqn{(b,a)}).
+//' @param init_pi     Length-3 mixing proportions with \eqn{\pi_1 = \pi_3}
+//'   (must sum to 1).
+//' @param max_steps   Maximum EM iterations (default 1000).
+//' @param tol         Convergence tolerance on the maximum relative parameter
+//'   change (default 1e-5).
+//'
+//' @return A list with the same structure as
+//'   \code{\link{estimate_mixture_cpp}}, with the additional element
+//'   \code{constrained = TRUE}.
+//' @export
+// [[Rcpp::export]]
+List estimate_mixture_constrained_cpp(const arma::vec& data,
+                                       const arma::mat& init_params,
+                                       const arma::vec& init_pi,
+                                       int    max_steps = 1000,
+                                       double tol       = 1e-5) {
+    int n = data.n_elem;
+
+    // --- Input validation ---
+    if ((int)init_params.n_rows != 3)
+        stop("init_params must have exactly 3 rows");
+    if ((int)init_pi.n_elem != 3)
+        stop("init_pi must have length 3");
+    if (std::abs(sum(init_pi) - 1.0) > 1e-6)
+        stop("init_pi must sum to 1");
+    if (init_params.min() <= 0.0)
+        stop("init_params must all be > 0");
+    if (std::abs(init_pi(0) - init_pi(2)) > 1e-6)
+        stop("init_pi[1] must equal init_pi[3] (constrained model requires x = pi[1] = pi[3])");
+
+    // --- Initialise ---
+    mat  params = init_params;
+    vec  pi     = init_pi;
+    mat  weights(n, 3);
+    double ll = -arma::datum::inf;
+
+    // Extract unique parameters for convergence tracking: (a, b, c, x)
+    auto unique_params = [](const mat& p, const vec& q) -> vec {
+        return vec({ p(0,0), p(0,1), p(1,0), q(0) });
+    };
+
+    // --- EM loop ---
+    int step = 0;
+    for (int iter = 0; iter < max_steps; iter++) {
+        vec old_unique = unique_params(params, pi);
+
+        // E-step (unconstrained: works with any params/pi)
+        List w_out = get_weights_cpp(data, params, pi);
+        weights    = as<mat>(w_out["weights"]);
+        ll         = as<double>(w_out["ll"]);
+
+        // M-step (constrained)
+        List p_out     = get_updated_params_constrained_cpp(data, weights);
+        mat  new_params = as<mat>(p_out["params"]);
+        vec  new_pi     = as<vec>(p_out["pi"]);
+
+        step++;
+        params = new_params;
+        pi     = new_pi;
+
+        // Convergence: max relative change in the 4 free parameters
+        vec new_unique = unique_params(params, pi);
+        double delta   = max_relerror_cpp(old_unique, new_unique);
+
+        if (step % 10 == 0) {
+            Rcpp::Rcout << "step " << step << "  delta " << delta << "\n";
+        }
+        if (delta < tol) break;
+    }
+
+    // BIC: 4 free parameters (a, b, c, x)
+    double bic = std::log((double)n) * 4.0 - 2.0 * ll;
+
+    // Sort components by ascending mean
+    vec means(3);
+    for (int k = 0; k < 3; k++) {
+        means(k) = params(k, 0) / (params(k, 0) + params(k, 1));
+    }
+    uvec order  = sort_index(means);
+    means       = means(order);
+    params      = params.rows(order);
+    pi          = pi(order);
+    weights     = weights.cols(order);
+
+    // Classification and uncertainty
+    uvec classification(n);
+    vec  uncertainty(n);
+    for (int i = 0; i < n; i++) {
+        uword  best_k = weights.row(i).index_max();
+        double max_w  = weights(i, best_k);
+        classification(i) = best_k + 1;
+        uncertainty(i)    = 1.0 - max_w;
+    }
+
+    return List::create(
+        Named("params")         = wrap(params),
+        Named("pi")             = wrap(pi),
+        Named("usedsteps")      = step,
+        Named("means")          = wrap(means),
+        Named("classification") = wrap(conv_to<ivec>::from(classification)),
+        Named("uncertainty")    = wrap(uncertainty),
+        Named("data")           = wrap(data),
+        Named("ll")             = ll,
+        Named("bic")            = bic,
+        Named("constrained")    = true
+    );
+}

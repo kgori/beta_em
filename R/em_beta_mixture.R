@@ -370,3 +370,149 @@ estimate_mixture <- function(data, init_params, init_pi,
         bic            = bic
     )
 }
+
+# ---------------------------------------------------------------------------
+# Constrained 3-component symmetric model
+# ---------------------------------------------------------------------------
+
+#' Generate constrained initial parameters for the symmetric Beta mixture
+#'
+#' Thin R wrapper around \code{\link{get_init_constrained_cpp}}.
+#'
+#' @param v Numeric vector of observations in \[0, 1\].
+#' @return A list with elements \code{params} (3 x 2 matrix satisfying
+#'   the symmetry constraint) and \code{pi} (mixing proportions with
+#'   \eqn{\pi_1 = \pi_3}).
+#' @export
+get_init_constrained <- function(v) {
+    get_init_constrained_cpp(v)
+}
+
+#' Constrained EM M-step for the symmetric Beta mixture model
+#'
+#' Thin R wrapper around \code{\link{get_updated_params_constrained_cpp}}.
+#'
+#' @inheritParams get_updated_params_constrained_cpp
+#' @return A list with elements \code{params} and \code{pi} satisfying the
+#'   symmetry constraints.
+#' @export
+get_updated_params_constrained <- function(data, weights) {
+    get_updated_params_constrained_cpp(data, weights)
+}
+
+#' Fit the constrained symmetric Beta mixture model by Expectation-Maximisation
+#'
+#' Fits the special-case 3-component model
+#' \deqn{x\,\mathrm{Beta}(a,b) \;+\; y\,\mathrm{Beta}(c,c) \;+\; x\,\mathrm{Beta}(b,a)}
+#' where the two outer components are mirror images of one another and share
+#' equal mixing weight, and the central component is symmetric about 0.5.
+#' This reduces the free parameters from 8 (unconstrained 3-component model)
+#' to 4: \eqn{(a, b, c, x)}.
+#'
+#' When \code{plot = FALSE} (the default) the entire EM loop runs in C++ via
+#' \code{\link{estimate_mixture_constrained_cpp}}.  When \code{plot = TRUE} the
+#' loop steps from R, calling the C++ E-step and constrained M-step each
+#' iteration.
+#'
+#' @param data       Numeric vector of observations in \[0, 1\].
+#' @param init_params \code{3 x 2} matrix of initial Beta parameters
+#'   satisfying the symmetry constraint.  If \code{NULL} (default),
+#'   \code{\link{get_init_constrained}} is called automatically.
+#' @param init_pi    Length-3 mixing proportions with \eqn{\pi_1 = \pi_3}
+#'   (must sum to 1).  Ignored when \code{init_params} is \code{NULL}.
+#' @param max_steps  Maximum number of EM iterations (default 1000).
+#' @param tol        Convergence tolerance (default 1e-5).
+#' @param plot       Logical; plot the model state after each iteration
+#'   (default FALSE).
+#'
+#' @return A list with the same structure as \code{\link{estimate_mixture}},
+#'   plus an additional element \code{constrained = TRUE}.  The BIC uses
+#'   4 free parameters rather than 8.
+#' @export
+estimate_mixture_constrained <- function(data,
+                                          init_params = NULL,
+                                          init_pi     = NULL,
+                                          max_steps   = 1000,
+                                          tol         = 1e-5,
+                                          plot        = FALSE) {
+    # --- Initialisation ---
+    if (is.null(init_params)) {
+        init <- get_init_constrained_cpp(data)
+        init_params <- init$params
+        init_pi     <- init$pi
+    }
+
+    # --- Input validation ---
+    if (!isTRUE(all.equal(sum(init_pi), 1)))
+        stop(paste0("init_pi must sum to 1: (", paste(init_pi, collapse = ", "), ")"))
+    if (any(init_params <= 0))
+        stop("init_params must all be > 0")
+    if (nrow(init_params) != 3L || length(init_pi) != 3L)
+        stop("Constrained model requires exactly 3 components")
+    if (!isTRUE(all.equal(init_pi[1], init_pi[3])))
+        stop("init_pi[1] must equal init_pi[3] (symmetric model requires x = pi[1] = pi[3])")
+
+    # --- Fast path: entire constrained loop in C++ ---
+    if (!plot) {
+        return(estimate_mixture_constrained_cpp(
+            data, init_params, init_pi, max_steps, tol
+        ))
+    }
+
+    # --- Diagnostic path: R loop with per-iteration plotting ---
+    params <- init_params
+    pi     <- init_pi
+    step   <- 0L
+
+    plot_estimation_step(data, params, pi, step)
+
+    for (i in seq_len(max_steps)) {
+        params_old <- params
+        pi_old     <- pi
+
+        # E-step (C++, unconstrained)
+        w_out   <- get_weights_cpp(data, params, pi)
+        weights <- w_out$weights
+
+        # M-step (C++, constrained)
+        p_out  <- get_updated_params_constrained_cpp(data, weights)
+        params <- p_out$params
+        pi     <- p_out$pi
+
+        step  <- step + 1L
+
+        # Convergence on unique parameters (a, b, c, x)
+        old_unique <- c(params_old[1, ], params_old[2, 1], pi_old[1])
+        new_unique <- c(params[1, ],     params[2, 1],     pi[1])
+        delta <- max_relerror(old_unique, new_unique)
+        if (step %% 10 == 0) message(step, "  ", delta)
+
+        plot_estimation_step(data, params, pi, step)
+
+        if (delta < tol) break
+    }
+
+    ll  <- get_weights_cpp(data, params, pi)$ll
+    bic <- log(length(data)) * 4 - 2 * ll   # 4 free parameters
+
+    # Sort by ascending component mean
+    means   <- params[, 1] / rowSums(params)
+    ord     <- order(means)
+    means   <- means[ord]
+    params  <- params[ord, , drop = FALSE]
+    pi      <- pi[ord]
+    weights <- weights[, ord, drop = FALSE]
+
+    list(
+        params         = params,
+        pi             = pi,
+        usedsteps      = step,
+        means          = means,
+        classification = apply(weights, 1, which.max),
+        uncertainty    = 1 - apply(weights, 1, max),
+        data           = data,
+        ll             = ll,
+        bic            = bic,
+        constrained    = TRUE
+    )
+}
