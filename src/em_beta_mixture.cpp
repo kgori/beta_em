@@ -210,33 +210,28 @@ List get_init_cpp(const arma::vec& v, int k = 3) {
         double lo = (double)i       / k;
         double hi = (double)(i + 1) / k;
 
-        // Collect data points in (lo, hi] (first bin includes 0)
-        vec bin;
+        // Single-pass accumulation: avoids repeated arma::vec reallocation.
+        // The first bin also includes x == 0 (mirrors the R implementation).
+        int    count = 0;
+        double s1 = 0.0, s2 = 0.0;   // sum and sum-of-squares
         for (uword j = 0; j < v.n_elem; j++) {
-            if (v(j) > lo && v(j) <= hi) {
-                bin.resize(bin.n_elem + 1);
-                bin(bin.n_elem - 1) = v(j);
-            }
-        }
-        // Edge: include exactly 0 in the first bin
-        if (i == 0) {
-            for (uword j = 0; j < v.n_elem; j++) {
-                if (v(j) == 0.0) {
-                    bin.resize(bin.n_elem + 1);
-                    bin(bin.n_elem - 1) = v(j);
-                }
+            double x = v(j);
+            if ((x > lo && x <= hi) || (i == 0 && x == 0.0)) {
+                count++;
+                s1 += x;
+                s2 += x * x;
             }
         }
 
         double mn, va;
-        if (bin.n_elem >= 2) {
-            mn = mean(bin);
-            va = var(bin);
-        } else if (bin.n_elem == 1) {
-            mn = bin(0);
-            va = 1e-6;          // tiny variance to avoid degenerate parameters
+        if (count >= 2) {
+            mn = s1 / count;
+            // Sample variance (matches R's var(), divides by count-1)
+            va = (s2 - s1 * s1 / count) / (count - 1);
+        } else if (count == 1) {
+            mn = s1;
+            va = 1e-6;
         } else {
-            // Empty bin: use bin midpoint and a small variance
             mn = (lo + hi) / 2.0;
             va = 1e-6;
         }
@@ -251,7 +246,7 @@ List get_init_cpp(const arma::vec& v, int k = 3) {
         vec ab = beta_ab_cpp(mn, va);
         params(i, 0) = ab(0);
         params(i, 1) = ab(1);
-        pi_vec(i) = (double)bin.n_elem;
+        pi_vec(i) = (double)count;
     }
 
     // Normalise pi
