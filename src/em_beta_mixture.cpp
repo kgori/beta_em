@@ -12,32 +12,23 @@ using namespace Rcpp;
 using namespace arma;
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal scalar helpers
 // ---------------------------------------------------------------------------
 
+// Fix 1: return std::pair<double,double> instead of vec to avoid a 2-element
+// heap allocation at every call site.
+//
 // Convert mean (mn) and variance (va) to Beta(a, b) parameters via method
 // of moments:  a = mn * ( mn*(1-mn)/va - 1 ),  b = a * (1/mn - 1)
-static vec beta_ab_cpp(double mn, double va) {
+static std::pair<double,double> beta_ab_cpp(double mn, double va) {
     double a = ((1.0 - mn) / va - 1.0 / mn) * mn * mn;
     double b = a * (1.0 / mn - 1.0);
-    return vec({a, b});
+    return {a, b};
 }
 
-// Element-wise log-likelihood of data under Beta(a, b)
-static vec beta_ll_cpp(const vec& data, double a, double b) {
-    int n = data.n_elem;
-    vec out(n);
-    for (int i = 0; i < n; i++) {
-        out(i) = R::dbeta(data(i), a, b, /*give_log=*/1);
-    }
-    return out;
-}
-
-// Numerically stable log-sum-exp for a single row vector
-static double log_sum_exp(const rowvec& x) {
-    double mx = x.max();
-    if (!std::isfinite(mx)) return mx;
-    return mx + std::log(sum(exp(x - mx)));
+// Clamp a scalar to [lo, hi]
+static inline double clamp_val(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
 // Maximum scaled absolute difference between two vectors:
@@ -52,6 +43,233 @@ static double max_relerror_cpp(const vec& va, const vec& vb) {
     }
     return max(numer / denom);
 }
+
+// wrap(arma::vec) produces a dim = c(n, 1) R matrix, not a plain vector.
+// Use this helper for all pi returns so callers always receive a 1-D vector.
+static inline Rcpp::NumericVector to_rvec(const arma::vec& v) {
+    return Rcpp::NumericVector(v.begin(), v.end());
+}
+
+// ---------------------------------------------------------------------------
+// Fix 6 + Fix 4 + Fix 5: Internal E-step
+//
+// Writes posterior weights and total log-likelihood directly into caller-
+// supplied arma objects — no Rcpp::List packing/unpacking, no SEXP copies.
+//
+// Fix 4: log-likelihoods written column-by-column (no intermediate vec of
+//        length n per component; column-major sequential writes).
+//
+// Fix 5: row-wise log-sum-exp computed via two column-major passes, avoiding
+//        both the rowvec temporaries and the stride-n row accesses that the
+//        old log_sum_exp(ll.row(i)) loop caused.
+// ---------------------------------------------------------------------------
+static void e_step_internal(const vec& data,
+                              const mat& params,
+                              const vec& pi,
+                              mat& weights,
+                              double& ll_out) {
+    const int ndata = data.n_elem;
+    const int ncomp = params.n_rows;
+
+    // Fix 4: build ll column-by-column (column-major, no intermediate vec)
+    mat ll(ndata, ncomp);
+    for (int k = 0; k < ncomp; k++) {
+        double log_pi_k = std::log(pi(k));
+        double a = params(k, 0), b = params(k, 1);
+        for (int i = 0; i < ndata; i++) {
+            ll(i, k) = log_pi_k + R::dbeta(data(i), a, b, /*give_log=*/1);
+        }
+    }
+
+    // Fix 5: row-wise log-sum-exp via two column-major passes.
+    // Pass 1: row-wise maximum
+    vec row_max(ndata);
+    row_max.fill(-arma::datum::inf);
+    for (int k = 0; k < ncomp; k++) {
+        for (int i = 0; i < ndata; i++) {
+            if (ll(i, k) > row_max(i)) row_max(i) = ll(i, k);
+        }
+    }
+    // Pass 2: accumulate exp(ll[i,k] - row_max[i]) into per-row sums
+    vec row_sum_exp(ndata, fill::zeros);
+    for (int k = 0; k < ncomp; k++) {
+        for (int i = 0; i < ndata; i++) {
+            if (std::isfinite(row_max(i)))
+                row_sum_exp(i) += std::exp(ll(i, k) - row_max(i));
+        }
+    }
+    // row_lse[i] = row_max[i] + log(row_sum_exp[i])
+    double total_ll = 0.0;
+    vec row_lse(ndata);
+    for (int i = 0; i < ndata; i++) {
+        row_lse(i) = std::isfinite(row_max(i))
+                         ? row_max(i) + std::log(row_sum_exp(i))
+                         : row_max(i);   // propagate -inf / NaN
+        total_ll += row_lse(i);
+    }
+    ll_out = total_ll;
+
+    // Weights = exp(ll[i,k] - row_lse[i]), column-by-column (cache-friendly)
+    for (int k = 0; k < ncomp; k++) {
+        for (int i = 0; i < ndata; i++) {
+            weights(i, k) = std::exp(ll(i, k) - row_lse(i));
+        }
+    }
+
+    // Fix bad rows (NaN/Inf from numerical under/overflow): assign point to
+    // leftmost component if x < 0.5, rightmost otherwise (mirrors R code).
+    for (int i = 0; i < ndata; i++) {
+        bool bad = false;
+        for (int k = 0; k < ncomp; k++) {
+            if (!std::isfinite(weights(i, k))) { bad = true; break; }
+        }
+        if (bad) {
+            for (int k = 0; k < ncomp; k++) weights(i, k) = 0.0;
+            weights(i, data(i) < 0.5 ? 0 : ncomp - 1) = 1.0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fix 6 + Fix 2: Internal M-step
+//
+// Updates params and pi without any Rcpp::List round-trips.
+//
+// Fix 2: weighted variance uses a scalar accumulator loop (column-major access
+//        to weights.col(k)), eliminating the two n-element heap allocations
+//        from the old  vec diff = data - means(k);  vars(k) = dot(diff % diff, ...)
+// ---------------------------------------------------------------------------
+static void m_step_internal(const vec& data,
+                              const mat& weights,
+                              mat& params,
+                              vec& pi) {
+    const int ncomp = weights.n_cols;
+    const int ndata  = weights.n_rows;
+
+    vec col_sums = sum(weights, 0).t();   // length ncomp
+    pi           = col_sums / ndata;       // colMeans(weights)
+
+    // Weighted means: mean_k = dot(data, weights[:,k]) / col_sums[k]
+    vec means(ncomp);
+    for (int k = 0; k < ncomp; k++) {
+        means(k) = dot(data, weights.col(k)) / col_sums(k);
+    }
+
+    // Fix 2: weighted variance via scalar accumulator (column-major access).
+    // var_k = sum_i (x_i - mean_k)^2 * w_ik  /  sum_i w_ik
+    params.set_size(ncomp, 2);
+    for (int k = 0; k < ncomp; k++) {
+        double mk   = means(k);
+        double cs   = col_sums(k);
+        double wvar = 0.0;
+        for (int i = 0; i < ndata; i++) {
+            double d = data(i) - mk;
+            wvar += d * d * weights(i, k);
+        }
+        wvar /= cs;
+        auto ab = beta_ab_cpp(mk, wvar);
+        params(k, 0) = ab.first;
+        params(k, 1) = ab.second;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fix 6 + Fix 3: Internal constrained M-step
+//
+// Updates params and pi for the symmetric 3-component model without any
+// Rcpp::List round-trips.
+//
+// Fix 3: the old code called join_cols twice (creating 2n-element temporaries)
+//        and computed arma diff vectors.  Replaced with scalar accumulator
+//        loops throughout.  The weight sums and outer weighted mean are fused
+//        into a single pass over the data.
+// ---------------------------------------------------------------------------
+static void m_step_constrained_internal(const vec& data,
+                                          const mat& weights,
+                                          mat& params,
+                                          vec& pi) {
+    const int n = data.n_elem;
+
+    // Single pass: component weight sums + outer augmented weighted mean
+    // augmented outer dataset = { (x_i, w1_i), (1-x_i, w3_i) }
+    double sum_w1 = 0.0, sum_w2 = 0.0, sum_w3 = 0.0;
+    double s1_outer = 0.0;
+    for (int i = 0; i < n; i++) {
+        double xi = data(i);
+        double w1 = weights(i, 0), w2 = weights(i, 1), w3 = weights(i, 2);
+        sum_w1   += w1;
+        sum_w2   += w2;
+        sum_w3   += w3;
+        s1_outer += xi * w1 + (1.0 - xi) * w3;
+    }
+    double total_ow = sum_w1 + sum_w3;
+
+    // --- Mixing proportions ---
+    double x_new = total_ow > 0.0 ? total_ow / (2.0 * n) : 1.0 / 3.0;
+    double y_new = sum_w2 / n;
+    x_new = clamp_val(x_new, 1e-6, 0.5 - 1e-6);
+    y_new = clamp_val(y_new, 1e-6, 1.0 - 2e-6);
+    double pi_total = 2.0 * x_new + y_new;
+    x_new /= pi_total;
+    y_new /= pi_total;
+
+    // --- Outer parameters (a, b) ---
+    double m_outer, v_outer;
+    if (total_ow > 0.0) {
+        m_outer = s1_outer / total_ow;
+        // Second pass for variance (needs mean)
+        double s2_outer = 0.0;
+        for (int i = 0; i < n; i++) {
+            double d1 = data(i)       - m_outer;
+            double d3 = (1.0 - data(i)) - m_outer;
+            s2_outer += d1 * d1 * weights(i, 0) + d3 * d3 * weights(i, 2);
+        }
+        v_outer = s2_outer / total_ow;
+    } else {
+        m_outer = 0.25;
+        v_outer = 0.01;
+    }
+    m_outer = clamp_val(m_outer, 1e-4, 1.0 - 1e-4);
+    double max_va_outer = m_outer * (1.0 - m_outer) - 1e-6;
+    v_outer = clamp_val(v_outer, 1e-8, max_va_outer);
+
+    auto ab  = beta_ab_cpp(m_outer, v_outer);
+    double a = ab.first, b = ab.second;
+    // Ensure component 1 is left-tail (a <= b => mean <= 0.5)
+    if (a > b) std::swap(a, b);
+    a = std::max(0.01, a);
+    b = std::max(0.01, b);
+
+    // --- Middle parameter (c) ---
+    // Beta(c, c) has mean = 0.5; estimate c from weighted variance around 0.5.
+    // Var[Beta(c,c)] = 1/(4*(2c+1))  =>  c = (1 - 4v) / (8v)
+    double c_val;
+    if (sum_w2 > 0.0) {
+        double v_mid = 0.0;
+        for (int i = 0; i < n; i++) {
+            double d = data(i) - 0.5;
+            v_mid += d * d * weights(i, 1);
+        }
+        v_mid /= sum_w2;
+        v_mid  = clamp_val(v_mid, 1e-8, 0.25 - 1e-6);
+        c_val  = (1.0 - 4.0 * v_mid) / (8.0 * v_mid);
+    } else {
+        c_val = 1.0;
+    }
+    c_val = std::max(0.01, c_val);
+
+    // --- Assemble ---
+    params.set_size(3, 2);
+    params(0, 0) = a;      params(0, 1) = b;
+    params(1, 0) = c_val;  params(1, 1) = c_val;
+    params(2, 0) = b;      params(2, 1) = a;
+
+    pi = { x_new, y_new, x_new };
+}
+
+// ===========================================================================
+// Exported functions
+// ===========================================================================
 
 // ---------------------------------------------------------------------------
 // Exported: E-step  —  get_weights_cpp
@@ -83,46 +301,13 @@ List get_weights_cpp(const arma::vec& data,
     if ((int)pi.n_elem != ncomp)
         stop("length(pi) must equal nrow(params)");
 
-    // Build log-likelihood matrix: ll[i, k] = log(pi[k]) + logdbeta(x_i; a_k, b_k)
-    mat ll(ndata, ncomp);
-    for (int k = 0; k < ncomp; k++) {
-        ll.col(k) = std::log(pi(k)) + beta_ll_cpp(data, params(k, 0), params(k, 1));
-    }
-
-    // Row-wise log-sum-exp for normalisation and total ll
-    vec row_lse(ndata);
-    for (int i = 0; i < ndata; i++) {
-        row_lse(i) = log_sum_exp(ll.row(i));
-    }
-    double total_ll = sum(row_lse);
-
-    // Weights = exp(ll - row_lse)
     mat weights(ndata, ncomp);
-    for (int k = 0; k < ncomp; k++) {
-        weights.col(k) = exp(ll.col(k) - row_lse);
-    }
-
-    // Fix NaN / Inf rows: observations that caused numerical under/overflow.
-    // Assign such points to the leftmost component if x < 0.5, otherwise to
-    // the rightmost component (mirrors the R implementation).
-    for (int i = 0; i < ndata; i++) {
-        bool bad = false;
-        for (int k = 0; k < ncomp; k++) {
-            if (!std::isfinite(weights(i, k))) { bad = true; break; }
-        }
-        if (bad) {
-            weights.row(i).zeros();
-            if (data(i) < 0.5) {
-                weights(i, 0) = 1.0;
-            } else {
-                weights(i, ncomp - 1) = 1.0;
-            }
-        }
-    }
+    double ll;
+    e_step_internal(data, params, pi, weights, ll);
 
     return List::create(
         Named("weights") = wrap(weights),
-        Named("ll")      = total_ll
+        Named("ll")      = ll
     );
 }
 
@@ -149,36 +334,13 @@ List get_weights_cpp(const arma::vec& data,
 // [[Rcpp::export]]
 List get_updated_params_cpp(const arma::vec& data,
                              const arma::mat& weights) {
-    int ncomp = weights.n_cols;
-    int ndata  = weights.n_rows;
-
-    vec col_sums = sum(weights, 0).t();   // ncomp
-    vec new_pi   = col_sums / ndata;       // colMeans(weights)
-
-    // Weighted means: mean_k = sum(x_i * w_ik) / sum(w_ik)
-    vec means(ncomp);
-    for (int k = 0; k < ncomp; k++) {
-        means(k) = dot(data, weights.col(k)) / col_sums(k);
-    }
-
-    // Weighted variances: var_k = sum((x_i - mean_k)^2 * w_ik) / sum(w_ik)
-    vec vars(ncomp);
-    for (int k = 0; k < ncomp; k++) {
-        vec diff = data - means(k);
-        vars(k) = dot(diff % diff, weights.col(k)) / col_sums(k);
-    }
-
-    // Convert (mean, var) -> (a, b) for each component
-    mat new_params(ncomp, 2);
-    for (int k = 0; k < ncomp; k++) {
-        vec ab = beta_ab_cpp(means(k), vars(k));
-        new_params(k, 0) = ab(0);
-        new_params(k, 1) = ab(1);
-    }
+    mat new_params;
+    vec new_pi;
+    m_step_internal(data, weights, new_params, new_pi);
 
     return List::create(
         Named("params") = wrap(new_params),
-        Named("pi")     = wrap(new_pi)
+        Named("pi")     = to_rvec(new_pi)
     );
 }
 
@@ -243,9 +405,9 @@ List get_init_cpp(const arma::vec& v, int k = 3) {
         if (max_va <= 0.0) max_va = 1e-6;
         va = std::max(1e-8, std::min(max_va, va));
 
-        vec ab = beta_ab_cpp(mn, va);
-        params(i, 0) = ab(0);
-        params(i, 1) = ab(1);
+        auto ab = beta_ab_cpp(mn, va);
+        params(i, 0) = ab.first;
+        params(i, 1) = ab.second;
         pi_vec(i) = (double)count;
     }
 
@@ -262,7 +424,7 @@ List get_init_cpp(const arma::vec& v, int k = 3) {
 
     return List::create(
         Named("params") = wrap(params),
-        Named("pi")     = wrap(pi_vec)
+        Named("pi")     = to_rvec(pi_vec)
     );
 }
 
@@ -299,7 +461,9 @@ List get_init_cpp(const arma::vec& v, int k = 3) {
 //'       observation.}
 //'     \item{data}{The input data vector (returned for convenience).}
 //'     \item{ll}{Observed-data log-likelihood at convergence.}
-//'     \item{bic}{Bayesian Information Criterion: \code{log(n)*ncomp - 2*ll}.}
+//'     \item{bic}{Bayesian Information Criterion: \code{log(n)*(3*ncomp-1) - 2*ll}.
+//'       The penalty uses \code{3*ncomp - 1} free parameters: \code{2*ncomp} Beta shape
+//'       parameters plus \code{ncomp - 1} free mixing weights.}
 //'   }
 //' @export
 // [[Rcpp::export]]
@@ -323,38 +487,29 @@ List estimate_mixture_cpp(const arma::vec& data,
         stop("init_params must all be > 0");
 
     // --- Initialise ---
-    mat  params = init_params;
-    vec  pi     = init_pi;
-    mat  weights(n, ncomp);
-    double ll = -arma::datum::inf;
+    mat    params  = init_params;
+    vec    pi      = init_pi;
+    mat    weights(n, ncomp);   // pre-allocated; reused every iteration
+    double ll      = -arma::datum::inf;
 
     // --- EM loop ---
     int step = 0;
     for (int iter = 0; iter < max_steps; iter++) {
-        mat  params_old = params;
-        vec  pi_old     = pi;
+        mat params_old = params;
+        vec pi_old     = pi;
 
-        // E-step
-        List w_out  = get_weights_cpp(data, params, pi);
-        weights     = as<mat>(w_out["weights"]);
-        ll          = as<double>(w_out["ll"]);
-
-        // M-step
-        List p_out  = get_updated_params_cpp(data, weights);
-        mat  new_params = as<mat>(p_out["params"]);
-        vec  new_pi     = as<vec>(p_out["pi"]);
+        // Fix 6: call internal functions directly — no Rcpp::List round-trips
+        e_step_internal(data, params, pi, weights, ll);
+        m_step_internal(data, weights, params, pi);
 
         step++;
 
         // Convergence check: max relative error across a, b and pi
         double delta = std::max({
-            max_relerror_cpp(params_old.col(0), new_params.col(0)),
-            max_relerror_cpp(params_old.col(1), new_params.col(1)),
-            max_relerror_cpp(pi_old,            new_pi)
+            max_relerror_cpp(params_old.col(0), params.col(0)),
+            max_relerror_cpp(params_old.col(1), params.col(1)),
+            max_relerror_cpp(pi_old,            pi)
         });
-
-        params = new_params;
-        pi     = new_pi;
 
         if (step % 10 == 0) {
             Rcpp::Rcout << "step " << step << "  delta " << delta << "\n";
@@ -363,18 +518,19 @@ List estimate_mixture_cpp(const arma::vec& data,
         if (delta < tol) break;
     }
 
-    // BIC = log(n) * ncomp - 2 * ll
-    double bic = std::log((double)n) * ncomp - 2.0 * ll;
+    // BIC: k = 3*ncomp - 1 free parameters
+    // (2*ncomp Beta shape params + ncomp-1 free mixing weights)
+    double bic = std::log((double)n) * (3 * ncomp - 1) - 2.0 * ll;
 
     // Component means = a / (a + b); sort by ascending mean
     vec means(ncomp);
     for (int k = 0; k < ncomp; k++) {
         means(k) = params(k, 0) / (params(k, 0) + params(k, 1));
     }
-    uvec order = sort_index(means);        // ascending order
-    means  = means(order);
-    params = params.rows(order);
-    pi     = pi(order);
+    uvec order = sort_index(means);
+    means   = means(order);
+    params  = params.rows(order);
+    pi      = pi(order);
     weights = weights.cols(order);
 
     // Classification (1-based) and uncertainty
@@ -389,7 +545,7 @@ List estimate_mixture_cpp(const arma::vec& data,
 
     return List::create(
         Named("params")         = wrap(params),
-        Named("pi")             = wrap(pi),
+        Named("pi")             = to_rvec(pi),
         Named("usedsteps")      = step,
         Named("means")          = wrap(means),
         Named("classification") = wrap(conv_to<ivec>::from(classification)),
@@ -405,13 +561,6 @@ List estimate_mixture_cpp(const arma::vec& data,
 //   params = { Beta(a,b),  Beta(c,c),  Beta(b,a) }
 //   pi     = { x,          y,          x         }   with 2x + y = 1
 // ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Internal helper: clamp a scalar to [lo, hi]
-// ---------------------------------------------------------------------------
-static inline double clamp_val(double v, double lo, double hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
 
 // ---------------------------------------------------------------------------
 // Exported: Constrained initialisation  —  get_init_constrained_cpp
@@ -468,7 +617,7 @@ List get_init_constrained_cpp(const arma::vec& v) {
 
     return List::create(
         Named("params") = wrap(new_params),
-        Named("pi")     = wrap(new_pi)
+        Named("pi")     = to_rvec(new_pi)
     );
 }
 
@@ -513,80 +662,18 @@ List get_init_constrained_cpp(const arma::vec& v) {
 // [[Rcpp::export]]
 List get_updated_params_constrained_cpp(const arma::vec& data,
                                          const arma::mat& weights) {
-    int n = data.n_elem;
-    if ((int)weights.n_rows != n)
+    if ((int)weights.n_rows != (int)data.n_elem)
         stop("length(data) must equal nrow(weights)");
     if ((int)weights.n_cols != 3)
         stop("weights must have exactly 3 columns");
 
-    // --- Mixing proportions -------------------------------------------
-    // Each outer component gets half of the combined outer weight.
-    double sum_outer = accu(weights.col(0)) + accu(weights.col(2));
-    double x_new     = sum_outer / (2.0 * n);
-    double y_new     = accu(weights.col(1)) / n;
-    // Clamp to avoid degenerate pi
-    x_new = clamp_val(x_new, 1e-6, 0.5 - 1e-6);
-    y_new = clamp_val(y_new, 1e-6, 1.0 - 2e-6);
-    // Re-normalise so that 2x + y = 1 exactly
-    double pi_total = 2.0 * x_new + y_new;
-    x_new /= pi_total;
-    y_new /= pi_total;
-
-    // --- Outer component parameters (a, b) ----------------------------
-    // Build augmented dataset:
-    //   original data[i] with weight w1[i]  → models Beta(a, b)
-    //   reflected (1-data[i]) with weight w3[i] → models Beta(a, b) via symmetry
-    vec aug_data    = join_cols(data, 1.0 - data);
-    vec aug_weights = join_cols(weights.col(0), weights.col(2));
-    double total_ow = sum(aug_weights);
-
-    double m_outer, v_outer;
-    if (total_ow > 0.0) {
-        m_outer = dot(aug_data, aug_weights) / total_ow;
-        vec diff = aug_data - m_outer;
-        v_outer  = dot(diff % diff, aug_weights) / total_ow;
-    } else {
-        m_outer = 0.25;
-        v_outer = 0.01;
-    }
-    m_outer = clamp_val(m_outer, 1e-4, 1.0 - 1e-4);
-    double max_va = m_outer * (1.0 - m_outer) - 1e-6;
-    v_outer = clamp_val(v_outer, 1e-8, max_va);
-
-    vec ab = beta_ab_cpp(m_outer, v_outer);
-    double a = ab(0), b = ab(1);
-    // Ensure component 1 remains the left-tail (a <= b => mean <= 0.5)
-    if (a > b) std::swap(a, b);
-    a = std::max(0.01, a);
-    b = std::max(0.01, b);
-
-    // --- Middle component parameter (c) --------------------------------
-    // Beta(c, c) is constrained to mean = 0.5; estimate c from the
-    // variance of data around 0.5 using component-2 weights.
-    // Var[Beta(c,c)] = 1 / (4*(2c+1))  =>  c = (1 - 4v) / (8v)
-    double total_mw = accu(weights.col(1));
-    double c_val;
-    if (total_mw > 0.0) {
-        vec diff_mid = data - 0.5;
-        double v_mid = dot(diff_mid % diff_mid, weights.col(1)) / total_mw;
-        v_mid  = clamp_val(v_mid, 1e-8, 0.25 - 1e-6);
-        c_val  = (1.0 - 4.0 * v_mid) / (8.0 * v_mid);
-    } else {
-        c_val = 1.0;
-    }
-    c_val = std::max(0.01, c_val);
-
-    // --- Assemble result ----------------------------------------------
-    mat new_params(3, 2);
-    new_params(0, 0) = a;      new_params(0, 1) = b;
-    new_params(1, 0) = c_val;  new_params(1, 1) = c_val;
-    new_params(2, 0) = b;      new_params(2, 1) = a;
-
-    vec new_pi = { x_new, y_new, x_new };
+    mat new_params;
+    vec new_pi;
+    m_step_constrained_internal(data, weights, new_params, new_pi);
 
     return List::create(
         Named("params") = wrap(new_params),
-        Named("pi")     = wrap(new_pi)
+        Named("pi")     = to_rvec(new_pi)
     );
 }
 
@@ -638,12 +725,12 @@ List estimate_mixture_constrained_cpp(const arma::vec& data,
         stop("init_pi[1] must equal init_pi[3] (constrained model requires x = pi[1] = pi[3])");
 
     // --- Initialise ---
-    mat  params = init_params;
-    vec  pi     = init_pi;
-    mat  weights(n, 3);
-    double ll = -arma::datum::inf;
+    mat    params  = init_params;
+    vec    pi      = init_pi;
+    mat    weights(n, 3);   // pre-allocated; reused every iteration
+    double ll      = -arma::datum::inf;
 
-    // Extract unique parameters for convergence tracking: (a, b, c, x)
+    // Extract the 4 free parameters (a, b, c, x) for convergence tracking
     auto unique_params = [](const mat& p, const vec& q) -> vec {
         return vec({ p(0,0), p(0,1), p(1,0), q(0) });
     };
@@ -653,23 +740,14 @@ List estimate_mixture_constrained_cpp(const arma::vec& data,
     for (int iter = 0; iter < max_steps; iter++) {
         vec old_unique = unique_params(params, pi);
 
-        // E-step (unconstrained: works with any params/pi)
-        List w_out = get_weights_cpp(data, params, pi);
-        weights    = as<mat>(w_out["weights"]);
-        ll         = as<double>(w_out["ll"]);
-
-        // M-step (constrained)
-        List p_out     = get_updated_params_constrained_cpp(data, weights);
-        mat  new_params = as<mat>(p_out["params"]);
-        vec  new_pi     = as<vec>(p_out["pi"]);
+        // Fix 6: call internal functions directly — no Rcpp::List round-trips
+        e_step_internal(data, params, pi, weights, ll);
+        m_step_constrained_internal(data, weights, params, pi);
 
         step++;
-        params = new_params;
-        pi     = new_pi;
 
-        // Convergence: max relative change in the 4 free parameters
-        vec new_unique = unique_params(params, pi);
-        double delta   = max_relerror_cpp(old_unique, new_unique);
+        vec    new_unique = unique_params(params, pi);
+        double delta      = max_relerror_cpp(old_unique, new_unique);
 
         if (step % 10 == 0) {
             Rcpp::Rcout << "step " << step << "  delta " << delta << "\n";
@@ -703,7 +781,7 @@ List estimate_mixture_constrained_cpp(const arma::vec& data,
 
     return List::create(
         Named("params")         = wrap(params),
-        Named("pi")             = wrap(pi),
+        Named("pi")             = to_rvec(pi),
         Named("usedsteps")      = step,
         Named("means")          = wrap(means),
         Named("classification") = wrap(conv_to<ivec>::from(classification)),

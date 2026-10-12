@@ -203,6 +203,7 @@ get_delta <- function(new_params, old_params, new_pi, old_pi) {
 #' @param step   Current iteration number (used in plot title).
 #' @export
 plot_estimation_step <- function(data, params, pi, step) {
+    pi         <- as.vector(pi)   # guard: C++ may return arma::vec as n×1 matrix
     weights_ll <- get_weights_cpp(data, params, pi)
     weights    <- weights_ll$weights
     ll         <- weights_ll$ll
@@ -348,7 +349,7 @@ estimate_mixture <- function(data, init_params, init_pi,
     }
 
     ll  <- get_weights_cpp(data, params, pi)$ll
-    bic <- log(length(data)) * ncomp - 2 * ll
+    bic <- log(length(data)) * (3 * ncomp - 1) - 2 * ll
 
     # Sort by ascending component mean
     means  <- params[, 1] / rowSums(params)
